@@ -821,7 +821,7 @@ for _ in range(10000):
         elif c_priv[k] < el_mbps[k]:
             # BL qua được nhưng EL riêng không đủ — chỉ xem BL
             dec, _ = codec.decode(bl_data[k], None, FRAME_SIZE)
-            dec = overlay_status(dec, "CHỈ BASE LAYER", (0, 200, 255))
+            dec = overlay_status(dec, "BL ONLY", (0, 200, 255))
             psnr = codec.compute_psnr(orig_frames[k], dec)
             user_frames.append(dec)
             user_labels.append(f"BL ONLY 📺  (U{k+1})")
