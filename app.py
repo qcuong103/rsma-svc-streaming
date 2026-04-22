@@ -810,9 +810,9 @@ for _ in range(10000):
         if c_common < bl_mbps[k]:
             black = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0], 3), dtype=np.uint8)
             noisy = add_noise_overlay(black, 60)
-            noisy = overlay_status(noisy, "MẤT KẾT NỐI", (0, 0, 255))
+            noisy = overlay_status(noisy, "DISCONNECTED", (0, 0, 255))
             user_frames.append(noisy)
-            user_labels.append("MẤT KẾT NỐI ⛔")
+            user_labels.append("DISCONNECTED ⛔")
             user_classes.append("status-out")
             user_psnrs.append(0.0)
             st.session_state.outage_count += 1
