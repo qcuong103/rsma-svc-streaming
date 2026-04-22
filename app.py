@@ -641,7 +641,7 @@ for _ in range(10000):
 
     # ── 4. Tối ưu RSMA Min-Max ──────────────────────────
     # R_req_common đảm bảo BL của CẢ 2 user đều qua được Common
-    R_req = bl_mbps * 2.0   # factor 2 vì cả 2 user đều cần BL
+    R_req = bl_mbps * 1.0   # factor 2 vì cả 2 user đều cần BL
     result = optimize_rsma_minmax(H, P_max_watt, R_req, noise_power)
 
     c_common   = result["C_common"]       # Mbps
