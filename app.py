@@ -396,36 +396,127 @@ def path_loss(distance_m: float, freq_ghz: float = 2.4) -> float:
     return max(h, 1e-12)
 
 
-def generate_test_frame(frame_idx: int, size=(320, 240)) -> np.ndarray:
+def generate_test_frame(frame_idx: int, size=(320, 240),
+                        color_seed: int = 0) -> np.ndarray:
     """
-    Tạo frame thử nghiệm có chuyển động (thay thế camera/video thực).
-    - Nền gradient thay đổi theo thời gian.
-    - Hình tròn di chuyển biểu diễn nội dung video.
+    Tạo frame thử nghiệm có chuyển động.
+    color_seed khác nhau cho mỗi UE → nền màu & hình khác nhau.
     """
     w, h = size
     frame = np.zeros((h, w, 3), dtype=np.uint8)
+    rng   = np.random.default_rng(color_seed)
+    base_r, base_g, base_b = int(rng.integers(10, 60)), \
+                              int(rng.integers(10, 60)), \
+                              int(rng.integers(20, 80))
 
-    # Nền gradient động
     t = frame_idx * 0.05
     for y in range(h):
-        r = int(20 + 15 * np.sin(t + y * 0.02))
-        g = int(30 + 10 * np.sin(t * 0.7 + y * 0.015))
-        b = int(50 + 20 * np.sin(t * 1.3 + y * 0.01))
+        r = int(base_r + 15 * np.sin(t + y * 0.02))
+        g = int(base_g + 10 * np.sin(t * 0.7 + y * 0.015))
+        b = int(base_b + 20 * np.sin(t * 1.3 + y * 0.01))
         frame[y, :] = [max(0, min(255, b)),
                        max(0, min(255, g)),
                        max(0, min(255, r))]
 
-    # Vòng tròn chuyển động (biểu diễn nội dung)
+    # Màu hình tròn khác nhau theo UE
+    circle_color = (0, 200, 255) if color_seed == 0 else (0, 80, 255)
     cx = int(w // 2 + (w // 3) * np.sin(t))
     cy = int(h // 2 + (h // 4) * np.cos(t * 0.8))
-    cv2.circle(frame, (cx, cy), 40, (0, 200, 255), -1)
-    cv2.circle(frame, (cx, cy), 40, (255, 255, 255), 2)
-
-    # Nhãn số frame
-    cv2.putText(frame, f"Frame #{frame_idx:04d}",
+    cv2.circle(frame, (cx, cy), 38, circle_color, -1)
+    cv2.circle(frame, (cx, cy), 38, (255, 255, 255), 2)
+    cv2.putText(frame, f"UE{color_seed+1} #{frame_idx:04d}",
                 (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
                 0.45, (200, 200, 200), 1, cv2.LINE_AA)
     return frame
+
+
+# ══════════════════════════════════════════════════════════
+# NGUỒN VIDEO ĐỘC LẬP CHO TỪNG UE
+# ══════════════════════════════════════════════════════════
+class VideoSource:
+    """
+    Quản lý nguồn video độc lập cho 1 UE.
+    - Nếu người dùng upload file MP4/AVI/MOV → đọc frame tuần tự.
+    - Nếu không có file → dùng generate_test_frame (màu riêng mỗi UE).
+    - Hỗ trợ loop: tự động quay đầu khi hết video.
+    """
+
+    def __init__(self, ue_idx: int):
+        self.ue_idx   = ue_idx       # 0 = UE1, 1 = UE2
+        self.cap      = None         # cv2.VideoCapture khi có file
+        self.filename = None         # Tên file đang dùng (để kiểm tra thay đổi)
+        self._tmppath = None         # Đường dẫn file tạm trên disk
+
+    def load_from_upload(self, uploaded_file) -> bool:
+        """
+        Nhận UploadedFile từ Streamlit, ghi vào /tmp và mở bằng cv2.
+        Trả về True nếu thành công, False nếu lỗi.
+        """
+        if uploaded_file is None:
+            return False
+
+        # Nếu đã load file này rồi → không load lại
+        if uploaded_file.name == self.filename and self.cap is not None:
+            return True
+
+        # Giải phóng VideoCapture cũ
+        self._release()
+
+        import tempfile, os
+        suffix = os.path.splitext(uploaded_file.name)[-1].lower()
+        # Ghi bytes ra file tạm (Streamlit UploadedFile không có path thực)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(uploaded_file.read())
+        tmp.flush()
+        tmp.close()
+
+        cap = cv2.VideoCapture(tmp.name)
+        if not cap.isOpened():
+            os.unlink(tmp.name)
+            return False
+
+        self.cap      = cap
+        self.filename = uploaded_file.name
+        self._tmppath = tmp.name
+        return True
+
+    def clear(self):
+        """Xoá nguồn video, quay về chế độ generate."""
+        self._release()
+        self.filename = None
+
+    def _release(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        if self._tmppath is not None:
+            try:
+                import os; os.unlink(self._tmppath)
+            except Exception:
+                pass
+            self._tmppath = None
+
+    def next_frame(self, frame_idx: int, size=(320, 240)) -> np.ndarray:
+        """Lấy frame tiếp theo: từ video thực hoặc frame giả lập."""
+        if self.cap is not None and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if not ret:
+                # Hết video → loop về đầu
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+            if ret:
+                return cv2.resize(frame, size)
+
+        # Fallback: sinh frame giả lập màu riêng của UE
+        return generate_test_frame(frame_idx, size, color_seed=self.ue_idx)
+
+    @property
+    def source_label(self) -> str:
+        """Nhãn hiển thị nguồn video hiện tại."""
+        if self.filename:
+            name = self.filename
+            return f"📹 {name[:28]}{'…' if len(name) > 28 else ''}"
+        return f"🔵 Tín hiệu giả lập UE{self.ue_idx + 1}"
 
 
 def overlay_status(frame: np.ndarray, label: str, color) -> np.ndarray:
@@ -484,6 +575,32 @@ with st.sidebar:
         "Nhiễu nền (dBm)", min_value=-120, max_value=-60, value=-100, step=5
     )
     noise_power = 10 ** ((noise_floor_dbm - 30) / 10)
+
+    st.markdown("---")
+    st.markdown("### 🎥 Tải video lên trạm BS")
+    st.caption("Hỗ trợ MP4 · AVI · MOV — mỗi UE 1 luồng riêng")
+
+    ue1_file = st.file_uploader(
+        "📤 Video UE1 (gần trạm)", type=["mp4", "avi", "mov"],
+        key="upload_ue1",
+        help="Upload video riêng của UE1. Nếu để trống sẽ dùng tín hiệu giả lập."
+    )
+    ue2_file = st.file_uploader(
+        "📤 Video UE2 (xa trạm)",  type=["mp4", "avi", "mov"],
+        key="upload_ue2",
+        help="Upload video riêng của UE2. Nếu để trống sẽ dùng tín hiệu giả lập."
+    )
+
+    # Nút xoá từng UE
+    col_c1, col_c2 = st.columns(2)
+    with col_c1:
+        if st.button("🗑 Reset UE1", use_container_width=True):
+            if "vsrc" in st.session_state:
+                st.session_state.vsrc[0].clear()
+    with col_c2:
+        if st.button("🗑 Reset UE2", use_container_width=True):
+            if "vsrc" in st.session_state:
+                st.session_state.vsrc[1].clear()
 
     st.markdown("---")
     st.markdown("### ℹ️ Thông tin hệ thống")
@@ -553,6 +670,18 @@ if "log_events"    not in st.session_state: st.session_state.log_events    = []
 if "outage_count"  not in st.session_state: st.session_state.outage_count  = 0
 if "bl_only_count" not in st.session_state: st.session_state.bl_only_count = 0
 if "total_frames"  not in st.session_state: st.session_state.total_frames  = 0
+
+# Khởi tạo VideoSource cho 2 UE — lưu trong session_state để tồn tại qua rerun
+if "vsrc" not in st.session_state:
+    st.session_state.vsrc = [VideoSource(0), VideoSource(1)]
+vsrc = st.session_state.vsrc  # shorthand
+
+# Nếu user vừa upload file mới → load vào VideoSource tương ứng
+for _k, _uploaded in enumerate([ue1_file, ue2_file]):
+    if _uploaded is not None:
+        _ok = vsrc[_k].load_from_upload(_uploaded)
+        if not _ok:
+            st.warning(f"⚠️ Không đọc được file video UE{_k+1}. Hãy dùng MP4/AVI/MOV hợp lệ.")
 
 codec = CustomSVCCodec(scale=0.5)
 FRAME_SIZE = (320, 240)
@@ -625,14 +754,22 @@ for _ in range(10000):
     idx = st.session_state.frame_idx
     st.session_state.total_frames += 1
 
-    # ── 1. Tạo frame gốc ────────────────────────────────
-    orig_frame = generate_test_frame(idx, FRAME_SIZE)
+    # ── 1. Lấy frame riêng của từng UE ──────────────────
+    # Mỗi UE có nguồn video độc lập (upload hoặc giả lập)
+    # → BL và EL của 2 UE sẽ khác nhau, phản ánh đúng thực tế
+    orig_frames = [vsrc[k].next_frame(idx, FRAME_SIZE) for k in range(2)]
 
-    # ── 2. Mã hóa SVC ───────────────────────────────────
-    bl_data, el_data, bl_bytes, el_bytes = codec.encode(orig_frame)
-    # Chuyển sang Mbps (giả sử mỗi frame gửi trong 1/fps giây)
-    bl_mbps = (bl_bytes * 8) / 1e6 * target_fps
-    el_mbps = (el_bytes * 8) / 1e6 * target_fps
+    # ── 2. Mã hóa SVC độc lập cho từng UE ───────────────
+    # bl_data[k], el_data[k]: dữ liệu lớp BL/EL của UE k
+    # bl_mbps[k], el_mbps[k]: bitrate yêu cầu của UE k (Mbps)
+    svc_results = [codec.encode(orig_frames[k]) for k in range(2)]
+    bl_data  = [svc_results[k][0] for k in range(2)]   # BL thumbnail
+    el_data  = [svc_results[k][1] for k in range(2)]   # EL residual
+    bl_bytes = [svc_results[k][2] for k in range(2)]   # bytes BL
+    el_bytes = [svc_results[k][3] for k in range(2)]   # bytes EL
+    # Chuyển sang Mbps (mỗi frame gửi trong 1/fps giây)
+    bl_mbps  = [(bl_bytes[k] * 8) / 1e6 * target_fps for k in range(2)]
+    el_mbps  = [(el_bytes[k] * 8) / 1e6 * target_fps for k in range(2)]
 
     # ── 3. Tính kênh truyền ─────────────────────────────
     h1 = path_loss(d1)
@@ -640,8 +777,10 @@ for _ in range(10000):
     H  = np.array([h1, h2])
 
     # ── 4. Tối ưu RSMA Min-Max ──────────────────────────
-    # R_req_common đảm bảo BL của CẢ 2 user đều qua được Common
-    R_req = bl_mbps * 1.0   # factor 2 vì cả 2 user đều cần BL
+    # R_req_common: Common stream phải đủ để mang BL của cả 2 UE
+    # Vì mỗi UE có video riêng → BL bitrate khác nhau
+    # Dùng max(bl_mbps[0], bl_mbps[1]): đảm bảo UE nào nặng hơn cũng qua được
+    R_req = max(bl_mbps[0], bl_mbps[1])
     result = optimize_rsma_minmax(H, P_max_watt, R_req, noise_power)
 
     c_common   = result["C_common"]       # Mbps
@@ -651,43 +790,50 @@ for _ in range(10000):
     opt_status = result["status"]
 
     # ── 5. Quyết định chất lượng video mỗi User ─────────
+    # Logic đúng cho RSMA:
+    # - Common stream mang BL → cả 2 user nhận được nếu c_common ≥ bl_mbps
+    # - Private stream mang EL riêng từng user → kiểm tra c_priv[k] ≥ el_mbps
+    # - Outage chỉ xảy ra khi c_common < bl_mbps (BL không qua được)
+    # - BL-Only khi c_common đủ nhưng c_priv[k] không đủ cho EL của user k
     user_frames  = []
     user_labels  = []
     user_classes = []
     user_psnrs   = []
 
+    # Kiểm tra từng UE độc lập:
+    # - Common stream phải ≥ bl_mbps[k] (BL của UE k) → UE k mới nhận được BL
+    # - Private stream phải ≥ el_mbps[k] (EL của UE k) → UE k mới nhận được EL
+    # Vì mỗi UE upload video riêng, bl_mbps[0] ≠ bl_mbps[1]
+
     for k in range(2):
-        # Kiểm tra Outage: Common không đủ cho BL
-        if c_common < bl_mbps:
-            # Mất kết nối hoàn toàn — hiển thị màn hình đen có nhiễu
+        # Outage UE k: Common không đủ mang BL của UE k
+        if c_common < bl_mbps[k]:
             black = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0], 3), dtype=np.uint8)
             noisy = add_noise_overlay(black, 60)
-            noisy = overlay_status(noisy, "DISCONECT", (0, 0, 255))
+            noisy = overlay_status(noisy, "MẤT KẾT NỐI", (0, 0, 255))
             user_frames.append(noisy)
-            user_labels.append("DISCONECT ⛔")
+            user_labels.append("MẤT KẾT NỐI ⛔")
             user_classes.append("status-out")
             user_psnrs.append(0.0)
-            if k == 0:
-                st.session_state.outage_count += 1
-                add_log(f"⛔ OUTAGE! C_common={c_common:.1f}<{bl_mbps:.1f} Mbps")
+            st.session_state.outage_count += 1
+            add_log(f"⛔ UE{k+1} OUTAGE: C_com={c_common:.2f} < BL={bl_mbps[k]:.2f} Mbps")
 
-        elif c_priv[k] < el_mbps:
-            # Chỉ có Base Layer — ảnh mờ
-            dec, _ = codec.decode(bl_data, None, FRAME_SIZE)
+        elif c_priv[k] < el_mbps[k]:
+            # BL qua được nhưng EL riêng không đủ — chỉ xem BL
+            dec, _ = codec.decode(bl_data[k], None, FRAME_SIZE)
             dec = overlay_status(dec, "CHỈ BASE LAYER", (0, 200, 255))
-            psnr = codec.compute_psnr(orig_frame, dec)
+            psnr = codec.compute_psnr(orig_frames[k], dec)
             user_frames.append(dec)
             user_labels.append(f"BL ONLY 📺  (U{k+1})")
             user_classes.append("status-sd")
             user_psnrs.append(psnr)
-            if k == 1:
-                st.session_state.bl_only_count += 1
-                add_log(f"⚠️ User2 BL-Only: C_priv={c_priv[1]:.1f}<{el_mbps:.1f} Mbps")
+            st.session_state.bl_only_count += 1
+            add_log(f"⚠️ UE{k+1} BL-Only: C_priv={c_priv[k]:.2f} < EL={el_mbps[k]:.2f} Mbps")
         else:
-            # Full HD — Base Layer + Enhancement Layer
-            dec, _ = codec.decode(bl_data, el_data, FRAME_SIZE)
+            # Full HD — BL + EL riêng của UE k
+            dec, _ = codec.decode(bl_data[k], el_data[k], FRAME_SIZE)
             dec = overlay_status(dec, "FULL HD ✓", (0, 255, 128))
-            psnr = codec.compute_psnr(orig_frame, dec)
+            psnr = codec.compute_psnr(orig_frames[k], dec)
             user_frames.append(dec)
             user_labels.append(f"FULL HD 🎬  (U{k+1})")
             user_classes.append("status-hd")
@@ -697,7 +843,7 @@ for _ in range(10000):
 
     # Video User 1
     ph_img1.image(frame_to_rgb(user_frames[0]),
-                  caption=f"User 1 | d={d1}m | h={h1:.2e}",
+                  caption=f"UE1 | {vsrc[0].source_label} | d={d1}m | h={h1:.2e}",
                   use_container_width=True)
     ph_status1.markdown(
         render_status_html(user_labels[0], user_classes[0],
@@ -708,7 +854,7 @@ for _ in range(10000):
 
     # Video User 2
     ph_img2.image(frame_to_rgb(user_frames[1]),
-                  caption=f"User 2 | d={d2}m | h={h2:.2e}",
+                  caption=f"UE2 | {vsrc[1].source_label} | d={d2}m | h={h2:.2e}",
                   use_container_width=True)
     ph_status2.markdown(
         render_status_html(user_labels[1], user_classes[1],
