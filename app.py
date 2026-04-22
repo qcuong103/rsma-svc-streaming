@@ -832,10 +832,10 @@ for _ in range(10000):
         else:
             # Full HD — BL + EL riêng của UE k
             dec, _ = codec.decode(bl_data[k], el_data[k], FRAME_SIZE)
-            dec = overlay_status(dec, "FULL HD ✓", (0, 255, 128))
+            dec = overlay_status(dec, "FULL HD ", (0, 255, 128))
             psnr = codec.compute_psnr(orig_frames[k], dec)
             user_frames.append(dec)
-            user_labels.append(f"FULL HD 🎬  (U{k+1})")
+            user_labels.append(f"FULL HD   (U{k+1})")
             user_classes.append("status-hd")
             user_psnrs.append(psnr)
 
