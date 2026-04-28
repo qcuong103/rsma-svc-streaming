@@ -1,13 +1,3 @@
-"""
-============================================================
- Mô phỏng thời gian thực: Truyền Video SVC qua mạng RSMA
- Thuật toán phân bổ công suất Min-Max Fairness
- Tác giả: Chuyên gia Kỹ sư Phần mềm & Nhà nghiên cứu Viễn thông
-============================================================
-Chạy: streamlit run app.py
-Yêu cầu: pip install streamlit numpy cvxpy opencv-python pandas
-"""
-
 import streamlit as st
 import numpy as np
 import cv2
@@ -15,6 +5,7 @@ import pandas as pd
 import time
 import math
 import warnings
+from svc_fgs import FGSEncoder, FGSDecoder, estimate_bitrate
 
 warnings.filterwarnings("ignore")
 
@@ -79,13 +70,6 @@ html, body, [class*="css"] {
     top: 0; left: 0;
     width: 3px; height: 100%;
     background: linear-gradient(180deg, #00d4ff, #0080ff);
-}
-
-.user-card-title {
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 1rem;
-    color: #00d4ff;
-    margin-bottom: 4px;
 }
 
 /* Badge trạng thái */
@@ -167,7 +151,6 @@ html, body, [class*="css"] {
     margin: 12px 0;
 }
 
-/* Ẩn footer Streamlit */
 footer {visibility: hidden;}
 #MainMenu {visibility: hidden;}
 </style>
@@ -177,195 +160,108 @@ footer {visibility: hidden;}
 # ══════════════════════════════════════════════════════════
 # THÀNH PHẦN 1 — BỘ MÃ HÓA SVC TUỲ CHỈNH (OpenCV)
 # ══════════════════════════════════════════════════════════
-class CustomSVCCodec:
-    """
-    Bộ mã hóa / giải mã video dạng SVC (Scalable Video Coding) đơn giản
-    sử dụng OpenCV.
-    - Base Layer (BL)   : ảnh nén 50% kích thước — thông tin thiết yếu.
-    - Enhancement Layer (EL): phần dư (residual) — thông tin chi tiết.
-    """
-
-    def __init__(self, scale: float = 0.5):
-        # Tỷ lệ thu nhỏ khi tạo Base Layer
-        self.scale = scale
+class AdvancedFGS_Codec:
+    def __init__(self, base_qp=28, n_bitplanes=8):
+        self.encoder = FGSEncoder(base_qp=base_qp, n_bitplanes=n_bitplanes)
+        self.decoder = FGSDecoder(base_qp=base_qp, n_bitplanes=n_bitplanes)
+        self.n_planes = n_bitplanes
 
     def encode(self, frame: np.ndarray):
-        """
-        Mã hóa 1 frame thành 2 lớp SVC.
-        Trả về: (bl_data, el_data, bl_bytes, el_bytes)
-        """
-        h, w = frame.shape[:2]
-        # ── Base Layer: nén nhỏ 50%
-        bl_small = cv2.resize(frame, (int(w * self.scale), int(h * self.scale)),
-                              interpolation=cv2.INTER_AREA)
-        # Phóng lại kích thước gốc để tính residual
-        bl_upscaled = cv2.resize(bl_small, (w, h),
-                                 interpolation=cv2.INTER_LINEAR)
+        # Resize và chuyển xám để thuật toán FGS chạy tối ưu trên Python
+        small_frame = cv2.resize(frame, (128, 128))
+        gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
 
-        # ── Enhancement Layer: phần dư giữa ảnh gốc và BL tái tạo
-        frame_f = frame.astype(np.float32)
-        bl_f    = bl_upscaled.astype(np.float32)
-        residual = frame_f - bl_f                       # Có thể âm hoặc dương
-        # Dịch về [0..255] để lưu trữ
-        el_shifted = (residual + 255.0).clip(0, 510) / 2.0  # [0..255]
-        el_uint8   = el_shifted.astype(np.uint8)
+        bl_data, enh_data = self.encoder.encode(gray)
+        bl_bits = estimate_bitrate(bl_data, enh_data, n_refine=0)
 
-        # Ước tính kích thước byte (giả lập nén JPEG)
-        _, bl_buf = cv2.imencode(".jpg", bl_small,  [cv2.IMWRITE_JPEG_QUALITY, 70])
-        _, el_buf = cv2.imencode(".jpg", el_uint8,  [cv2.IMWRITE_JPEG_QUALITY, 50])
+        el_bits_array = []
+        for p in range(1, self.n_planes + 1):
+            bits_upto_p = estimate_bitrate(bl_data, enh_data, n_refine=p)
+            bits_upto_prev = estimate_bitrate(bl_data, enh_data, n_refine=p-1)
+            el_bits_array.append((bits_upto_p - bits_upto_prev) // 8) # Đổi bit ra byte
 
-        return bl_small, el_uint8, len(bl_buf), len(el_buf)
+        return bl_data, enh_data, (bl_bits // 8), el_bits_array, gray.shape
 
-    def decode(self, bl_small: np.ndarray, el_data=None,
-               target_size=(320, 240)):
-        """
-        Giải mã frame SVC.
-        - Chỉ có BL  → ảnh mờ (phóng to BL).
-        - Có cả EL   → ảnh nét (BL + residual).
-        Trả về (frame_decoded, quality_label)
-        """
-        h, w = target_size[1], target_size[0]
-        bl_up = cv2.resize(bl_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    def decode(self, bl_data, enh_data, layers_received: int, orig_shape):
+        recon_gray = self.decoder.decode(bl_data, enh_data, orig_shape, n_refine=layers_received)
+        recon_bgr = cv2.cvtColor(recon_gray, cv2.COLOR_GRAY2BGR)
 
-        if el_data is None:
-            # Chỉ Base Layer — ảnh mờ
-            return bl_up, "BL_ONLY"
+        if layers_received == 0:
+            status = "BL ONLY"
+        elif layers_received == self.n_planes:
+            status = "FULL QUALITY"
+        else:
+            status = f"FGS LEVEL {layers_received}/{self.n_planes}"
 
-        # Khôi phục residual từ EL đã dịch
-        el_resized = cv2.resize(el_data, (w, h), interpolation=cv2.INTER_LINEAR)
-        residual   = el_resized.astype(np.float32) * 2.0 - 255.0
-        reconstructed = (bl_up.astype(np.float32) + residual).clip(0, 255)
-        return reconstructed.astype(np.uint8), "FULL_HD"
+        return recon_bgr, status
 
     @staticmethod
     def compute_psnr(original: np.ndarray, decoded: np.ndarray) -> float:
-        """Tính PSNR (dB) giữa ảnh gốc và ảnh giải mã."""
         if original.shape != decoded.shape:
             decoded = cv2.resize(decoded, (original.shape[1], original.shape[0]))
         mse = np.mean((original.astype(np.float64) - decoded.astype(np.float64)) ** 2)
-        if mse < 1e-10:
-            return 100.0
+        if mse < 1e-10: return 100.0
         return 10 * math.log10(255.0 ** 2 / mse)
-
 
 # ══════════════════════════════════════════════════════════
 # THÀNH PHẦN 2 — TỐI ƯU RSMA MIN-MAX FAIRNESS (CVXPY)
 # ══════════════════════════════════════════════════════════
 def optimize_rsma_minmax(H: np.ndarray, P_max: float,
                           R_req_common: float, noise_power: float = 1e-9):
-    """
-    Giải bài toán phân bổ công suất RSMA theo tiêu chí Min-Max Fairness.
-
-    Mô hình RSMA đường lên (Uplink):
-    - Mỗi người dùng k gửi: x_k = x_k^c (common) + x_k^p (private)
-    - Bộ thu dùng SIC: giải mã Common trước, sau đó Private.
-
-    Tham số:
-        H            : mảng shape (K,) — độ lợi kênh của K người dùng
-        P_max        : tổng công suất tối đa (Watt)
-        R_req_common : tốc độ tối thiểu cần cho BL (Mbps)
-        noise_power  : công suất nhiễu nền (Watt)
-
-    Kết quả:
-        dict chứa P_common, P_private_1, P_private_2, C_common,
-                  C_private_1, C_private_2, status
-    """
     try:
         import cvxpy as cp
+        K = len(H)
+        p_c = cp.Variable(K, nonneg=True)
+        p_p = cp.Variable(K, nonneg=True)
 
-        K = len(H)   # Số người dùng (= 2 trong bài toán này)
-
-        # ── Biến tối ưu ──────────────────────────────────────────
-        # p_c[k] : công suất Common của user k
-        # p_p[k] : công suất Private của user k
-        p_c = cp.Variable(K, nonneg=True)   # Công suất Common
-        p_p = cp.Variable(K, nonneg=True)   # Công suất Private
-
-        # ── Ràng buộc công suất ──────────────────────────────────
-        constraints = []
-        # Tổng công suất không vượt P_max
-        constraints.append(cp.sum(p_c) + cp.sum(p_p) <= P_max)
-        # Mỗi user không phát âm
+        constraints = [cp.sum(p_c) + cp.sum(p_p) <= P_max]
         for k in range(K):
-            constraints.append(p_c[k] >= 0)
-            constraints.append(p_p[k] >= 0)
+            constraints.extend([p_c[k] >= 0, p_p[k] >= 0])
 
-        # ── Tính SINR & Capacity (Tuyến tính hoá log để dùng CVXPY) ─
-        # RSMA đường lên: Common được giải mã trước (SIC bậc 1)
-        # SINR_common_k = H[k]^2 * p_c[k] / (H[k]^2 * p_p[k] + noise)
-        # C_common = sum_k log2(1 + SINR_common_k)  — gần đúng tuyến tính
+        BW = 1.0 # Băng thông 1MHz
 
-        # Vì log không lồi lõm thuận tiện trong CVXPY standard,
-        # dùng xấp xỉ tuyến tính: C ≈ B * log2(1 + H^2*P / noise)
-        # với B = 1 (chuẩn hoá băng thông = 1 Hz)
-
-        # Để giữ bài toán convex, ta sử dụng biến thay thế:
-        #   Xây dựng lower-bound capacity dạng log-sum bằng cp.log
-        BW = 1e6  # 1 MHz băng thông (chuẩn hoá), đơn vị Mbps
-
-        # SINR Common của mỗi user (xấp xỉ, nhiễu = noise_power)
-        # Capacity Common tổng = sum log2(1 + H_k^2 * p_c[k] / noise)
         cap_common_terms = []
         cap_private_terms = []
         for k in range(K):
             h2 = float(H[k] ** 2)
-            # Dùng cp.log(1 + ...) / log(2) * BW
-            # Nhiễu tại Common: chỉ nhiễu Gaussian (SIC lý tưởng)
             sinr_c = h2 * p_c[k] / noise_power
             cap_c  = BW * cp.log(1 + sinr_c) / np.log(2)
             cap_common_terms.append(cap_c)
 
-            # Nhiễu tại Private: sau khi trừ Common (SIC)
             sinr_p = h2 * p_p[k] / noise_power
             cap_p  = BW * cp.log(1 + sinr_p) / np.log(2)
             cap_private_terms.append(cap_p)
 
-        # Tổng capacity Common phải ≥ R_req_common
-        total_cap_common = sum(cap_common_terms)
-        constraints.append(total_cap_common >= R_req_common)
+        constraints.append(sum(cap_common_terms) >= R_req_common)
 
-        # ── Mục tiêu Min-Max Fairness ────────────────────────────
-        # Tối đa hoá capacity Private nhỏ nhất trong 2 user
-        t = cp.Variable()   # Biến phụ: min capacity private
+        t = cp.Variable()
         for k in range(K):
             constraints.append(cap_private_terms[k] >= t)
 
-        objective = cp.Maximize(t)
-
-        # ── Giải bài toán ────────────────────────────────────────
-        prob = cp.Problem(objective, constraints)
+        prob = cp.Problem(cp.Maximize(t), constraints)
         prob.solve(solver=cp.SCS, verbose=False, eps=1e-4)
 
         if prob.status not in ["optimal", "optimal_inaccurate"]:
             raise ValueError(f"CVXPY: {prob.status}")
 
-        # Lấy kết quả
         pc_val = np.maximum(p_c.value, 0)
         pp_val = np.maximum(p_p.value, 0)
 
-        def cap(h, p):
-            return BW * np.log2(1 + h**2 * p / noise_power)
-
-        c_common   = sum(cap(H[k], pc_val[k]) for k in range(K))
-        c_private  = [cap(H[k], pp_val[k]) for k in range(K)]
+        def cap(h, p): return BW * np.log2(1 + h**2 * p / noise_power)
 
         return {
             "P_common":    pc_val,
             "P_private":   pp_val,
-            "C_common":    float(c_common),
-            "C_private":   [float(c) for c in c_private],
+            "C_common":    float(sum(cap(H[k], pc_val[k]) for k in range(K))),
+            "C_private":   [float(cap(H[k], pp_val[k])) for k in range(K)],
             "status":      "optimal",
         }
 
     except Exception as e:
-        # Trả về kết quả mặc định khi không khả thi (fallback)
         pc_fallback = np.array([P_max * 0.4, P_max * 0.4])
         pp_fallback = np.array([P_max * 0.1, P_max * 0.1])
-        BW = 1e6
         noise_power_fb = noise_power if noise_power else 1e-9
-
-        def cap_fb(h, p):
-            return BW * np.log2(1 + float(h)**2 * p / noise_power_fb)
+        def cap_fb(h, p): return 1.0 * np.log2(1 + float(h)**2 * p / noise_power_fb)
 
         return {
             "P_common":    pc_fallback,
@@ -380,53 +276,28 @@ def optimize_rsma_minmax(H: np.ndarray, P_max: float,
 # HÀM PHỤ TRỢ — Kênh truyền & Frame giả lập
 # ══════════════════════════════════════════════════════════
 def path_loss(distance_m: float, freq_ghz: float = 2.4) -> float:
-    """
-    Tính suy hao đường truyền theo mô hình Free-Space (FSPL).
-    Kết quả: hệ số kênh h (biên độ).
-    """
-    # FSPL (dB) = 20*log10(d) + 20*log10(f) + 20*log10(4π/c)
-    fspl_db = (20 * np.log10(max(distance_m, 1)) +
-               20 * np.log10(freq_ghz * 1e9) +
-               20 * np.log10(4 * np.pi / 3e8))
-    # Thêm fading Rayleigh nhỏ (±3 dB)
-    fading_db = np.random.normal(0, 3)
-    total_db = fspl_db + fading_db
-    # Chuyển về hệ số tuyến tính
-    h = 10 ** (-total_db / 20)
-    return max(h, 1e-12)
+    fspl_db = (20 * np.log10(max(distance_m, 1)) + 20 * np.log10(freq_ghz * 1e9) + 20 * np.log10(4 * np.pi / 3e8))
+    total_db = fspl_db + np.random.normal(0, 3)
+    return max(10 ** (-total_db / 20), 1e-12)
 
 
-def generate_test_frame(frame_idx: int, size=(320, 240),
-                        color_seed: int = 0) -> np.ndarray:
-    """
-    Tạo frame thử nghiệm có chuyển động.
-    color_seed khác nhau cho mỗi UE → nền màu & hình khác nhau.
-    """
+def generate_test_frame(frame_idx: int, size=(320, 240), color_seed: int = 0) -> np.ndarray:
     w, h = size
     frame = np.zeros((h, w, 3), dtype=np.uint8)
     rng   = np.random.default_rng(color_seed)
-    base_r, base_g, base_b = int(rng.integers(10, 60)), \
-                              int(rng.integers(10, 60)), \
-                              int(rng.integers(20, 80))
-
+    base_r, base_g, base_b = int(rng.integers(10, 60)), int(rng.integers(10, 60)), int(rng.integers(20, 80))
     t = frame_idx * 0.05
     for y in range(h):
         r = int(base_r + 15 * np.sin(t + y * 0.02))
         g = int(base_g + 10 * np.sin(t * 0.7 + y * 0.015))
         b = int(base_b + 20 * np.sin(t * 1.3 + y * 0.01))
-        frame[y, :] = [max(0, min(255, b)),
-                       max(0, min(255, g)),
-                       max(0, min(255, r))]
-
-    # Màu hình tròn khác nhau theo UE
+        frame[y, :] = [max(0, min(255, b)), max(0, min(255, g)), max(0, min(255, r))]
     circle_color = (0, 200, 255) if color_seed == 0 else (0, 80, 255)
     cx = int(w // 2 + (w // 3) * np.sin(t))
     cy = int(h // 2 + (h // 4) * np.cos(t * 0.8))
     cv2.circle(frame, (cx, cy), 38, circle_color, -1)
     cv2.circle(frame, (cx, cy), 38, (255, 255, 255), 2)
-    cv2.putText(frame, f"UE{color_seed+1} #{frame_idx:04d}",
-                (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
-                0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"UE{color_seed+1} #{frame_idx:04d}", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
     return frame
 
 
@@ -434,111 +305,65 @@ def generate_test_frame(frame_idx: int, size=(320, 240),
 # NGUỒN VIDEO ĐỘC LẬP CHO TỪNG UE
 # ══════════════════════════════════════════════════════════
 class VideoSource:
-    """
-    Quản lý nguồn video độc lập cho 1 UE.
-    - Nếu người dùng upload file MP4/AVI/MOV → đọc frame tuần tự.
-    - Nếu không có file → dùng generate_test_frame (màu riêng mỗi UE).
-    - Hỗ trợ loop: tự động quay đầu khi hết video.
-    """
-
     def __init__(self, ue_idx: int):
-        self.ue_idx   = ue_idx       # 0 = UE1, 1 = UE2
-        self.cap      = None         # cv2.VideoCapture khi có file
-        self.filename = None         # Tên file đang dùng (để kiểm tra thay đổi)
-        self._tmppath = None         # Đường dẫn file tạm trên disk
+        self.ue_idx = ue_idx
+        self.cap = None
+        self.filename = None
+        self._tmppath = None
 
     def load_from_upload(self, uploaded_file) -> bool:
-        """
-        Nhận UploadedFile từ Streamlit, ghi vào /tmp và mở bằng cv2.
-        Trả về True nếu thành công, False nếu lỗi.
-        """
-        if uploaded_file is None:
-            return False
-
-        # Nếu đã load file này rồi → không load lại
-        if uploaded_file.name == self.filename and self.cap is not None:
-            return True
-
-        # Giải phóng VideoCapture cũ
+        if uploaded_file is None: return False
+        if uploaded_file.name == self.filename and self.cap is not None: return True
         self._release()
-
         import tempfile, os
         suffix = os.path.splitext(uploaded_file.name)[-1].lower()
-        # Ghi bytes ra file tạm (Streamlit UploadedFile không có path thực)
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp.write(uploaded_file.read())
-        tmp.flush()
-        tmp.close()
-
+        tmp.flush(); tmp.close()
         cap = cv2.VideoCapture(tmp.name)
         if not cap.isOpened():
-            os.unlink(tmp.name)
-            return False
-
-        self.cap      = cap
-        self.filename = uploaded_file.name
-        self._tmppath = tmp.name
+            os.unlink(tmp.name); return False
+        self.cap = cap; self.filename = uploaded_file.name; self._tmppath = tmp.name
         return True
 
     def clear(self):
-        """Xoá nguồn video, quay về chế độ generate."""
-        self._release()
-        self.filename = None
+        self._release(); self.filename = None
 
     def _release(self):
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        if self.cap is not None: self.cap.release(); self.cap = None
         if self._tmppath is not None:
-            try:
-                import os; os.unlink(self._tmppath)
-            except Exception:
-                pass
+            try: import os; os.unlink(self._tmppath)
+            except: pass
             self._tmppath = None
 
     def next_frame(self, frame_idx: int, size=(320, 240)) -> np.ndarray:
-        """Lấy frame tiếp theo: từ video thực hoặc frame giả lập."""
         if self.cap is not None and self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret:
-                # Hết video → loop về đầu
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self.cap.read()
-            if ret:
-                return cv2.resize(frame, size)
-
-        # Fallback: sinh frame giả lập màu riêng của UE
+            if ret: return cv2.resize(frame, size)
         return generate_test_frame(frame_idx, size, color_seed=self.ue_idx)
 
     @property
     def source_label(self) -> str:
-        """Nhãn hiển thị nguồn video hiện tại."""
         if self.filename:
             name = self.filename
-            return f"📹 {name[:28]}{'…' if len(name) > 28 else ''}"
+            return f"📹 {name[:20]}{'…' if len(name) > 20 else ''}"
         return f"🔵 Tín hiệu giả lập UE{self.ue_idx + 1}"
 
-
 def overlay_status(frame: np.ndarray, label: str, color) -> np.ndarray:
-    """Thêm nhãn trạng thái lên góc trái dưới frame."""
     out = frame.copy()
     h, w = out.shape[:2]
     cv2.rectangle(out, (0, h - 28), (w, h), (0, 0, 0), -1)
-    cv2.putText(out, label,
-                (6, h - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, color, 1, cv2.LINE_AA)
+    cv2.putText(out, label, (6, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
     return out
 
-
 def frame_to_rgb(frame: np.ndarray) -> np.ndarray:
-    """Chuyển BGR (OpenCV) → RGB (Streamlit)."""
-    if len(frame.shape) == 2:
-        return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+    if len(frame.shape) == 2: return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-
 def add_noise_overlay(frame: np.ndarray, intensity=40) -> np.ndarray:
-    """Thêm nhiễu ảnh để mô phỏng mất gói nghiêm trọng."""
     noise = np.random.randint(0, intensity, frame.shape, dtype=np.uint8)
     return cv2.add(frame, noise)
 
@@ -551,102 +376,72 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("### 🔋 Công suất phát")
-    P_max_dbm = st.slider(
-        "P_max (dBm)", min_value=10, max_value=40, value=23, step=1,
-        help="Tổng công suất phát tối đa của trạm gốc"
-    )
-    P_max_watt = 10 ** ((P_max_dbm - 30) / 10)  # dBm → Watt
+    P_max_dbm = st.slider("P_max (dBm)", min_value=10, max_value=40, value=23, step=1)
+    P_max_watt = 10 ** ((P_max_dbm - 30) / 10)
 
     st.markdown("### 📍 Khoảng cách người dùng")
-    d1 = st.slider(
-        "User 1 – Gần (m)", min_value=10, max_value=500, value=80, step=10,
-        help="Khoảng cách User 1 tới trạm gốc"
-    )
-    d2 = st.slider(
-        "User 2 – Xa (m)", min_value=100, max_value=2000, value=600, step=50,
-        help="Khoảng cách User 2 tới trạm gốc"
-    )
+    d1 = st.slider("User 1 – Gần (m)", min_value=10, max_value=500, value=80, step=10)
+    d2 = st.slider("User 2 – Xa (m)", min_value=100, max_value=2000, value=600, step=50)
 
-    st.markdown("### 🎬 Tham số Video")
-    target_fps = st.slider(
-        "Tốc độ mô phỏng (fps)", min_value=1, max_value=10, value=3, step=1
-    )
-    noise_floor_dbm = st.slider(
-        "Nhiễu nền (dBm)", min_value=-120, max_value=-60, value=-100, step=5
-    )
+    st.markdown("### 🎬 Kênh truyền")
+    noise_floor_dbm = st.slider("Nhiễu nền (dBm)", min_value=-120, max_value=-60, value=-100, step=5)
     noise_power = 10 ** ((noise_floor_dbm - 30) / 10)
+
+    # Đã gỡ bỏ thanh trượt Tốc độ FPS.
 
     st.markdown("---")
     st.markdown("### 🎥 Tải video lên trạm BS")
-    st.caption("Hỗ trợ MP4 · AVI · MOV — mỗi UE 1 luồng riêng")
+    ue1_file = st.file_uploader("📤 Video UE1", type=["mp4", "avi", "mov"], key="upload_ue1")
+    ue2_file = st.file_uploader("📤 Video UE2", type=["mp4", "avi", "mov"], key="upload_ue2")
 
-    ue1_file = st.file_uploader(
-        "📤 Video UE1 (gần trạm)", type=["mp4", "avi", "mov"],
-        key="upload_ue1",
-        help="Upload video riêng của UE1. Nếu để trống sẽ dùng tín hiệu giả lập."
-    )
-    ue2_file = st.file_uploader(
-        "📤 Video UE2 (xa trạm)",  type=["mp4", "avi", "mov"],
-        key="upload_ue2",
-        help="Upload video riêng của UE2. Nếu để trống sẽ dùng tín hiệu giả lập."
-    )
-
-    # Nút xoá từng UE
     col_c1, col_c2 = st.columns(2)
     with col_c1:
         if st.button("🗑 Reset UE1", use_container_width=True):
-            if "vsrc" in st.session_state:
-                st.session_state.vsrc[0].clear()
+            if "vsrc" in st.session_state: st.session_state.vsrc[0].clear()
     with col_c2:
         if st.button("🗑 Reset UE2", use_container_width=True):
-            if "vsrc" in st.session_state:
-                st.session_state.vsrc[1].clear()
+            if "vsrc" in st.session_state: st.session_state.vsrc[1].clear()
 
-    st.markdown("---")
-    st.markdown("### ℹ️ Thông tin hệ thống")
-    st.markdown(f"""
-    <div style='font-size:0.78rem; color:#5588aa; font-family:monospace;'>
-    • Mô hình: RSMA Uplink 2-User<br>
-    • Codec: SVC (BL + EL)<br>
-    • Tối ưu: Min-Max Fairness<br>
-    • Solver: CVXPY / SCS<br>
-    • Kênh: FSPL + Rayleigh fading<br>
-    </div>
-    """, unsafe_allow_html=True)
-
-    run_sim = st.toggle("▶ Chạy mô phỏng", value=True)
+    run_sim = st.toggle("▶ Chạy mô phỏng (Frame-by-Frame)", value=True)
 
 
 # ══════════════════════════════════════════════════════════
 # GIAO DIỆN STREAMLIT — MAIN
 # ══════════════════════════════════════════════════════════
-st.markdown('<div class="main-title">📡 MÔ PHỎNG RSMA-SVC — TRUYỀN VIDEO ĐỘ TRỄ THẤP</div>',
-            unsafe_allow_html=True)
+st.markdown('<div class="main-title">📡 MÔ PHỎNG RSMA FGS — FRAME-BY-FRAME</div>', unsafe_allow_html=True)
 
-# Hàng 1: 2 cột Video
+# Hàng 1: Khai báo Cấu trúc So sánh (Original vs Received)
 col_v1, col_v2 = st.columns(2)
 
 with col_v1:
-    st.markdown("#### 👤 User 1 — Gần trạm")
-    ph_img1     = st.empty()
-    ph_status1  = st.empty()
-    ph_metrics1 = st.empty()
+    st.markdown("#### 👤 User 1 (Gần trạm)")
+    c1_orig, c1_recv = st.columns(2)
+    with c1_orig:
+        st.markdown("<div style='text-align:center; color:#88aaff; font-size:0.85rem;'>UE gửi (Original)</div>", unsafe_allow_html=True)
+        ph_img1_orig = st.empty()
+    with c1_recv:
+        st.markdown("<div style='text-align:center; color:#88aaff; font-size:0.85rem;'>BS nhận (Decoded)</div>", unsafe_allow_html=True)
+        ph_img1_recv = st.empty()
+    ph_status1 = st.empty()
 
 with col_v2:
-    st.markdown("#### 👥 User 2 — Xa trạm")
-    ph_img2     = st.empty()
-    ph_status2  = st.empty()
-    ph_metrics2 = st.empty()
+    st.markdown("#### 👥 User 2 (Xa trạm)")
+    c2_orig, c2_recv = st.columns(2)
+    with c2_orig:
+        st.markdown("<div style='text-align:center; color:#88aaff; font-size:0.85rem;'>UE gửi (Original)</div>", unsafe_allow_html=True)
+        ph_img2_orig = st.empty()
+    with c2_recv:
+        st.markdown("<div style='text-align:center; color:#88aaff; font-size:0.85rem;'>BS nhận (Decoded)</div>", unsafe_allow_html=True)
+        ph_img2_recv = st.empty()
+    ph_status2 = st.empty()
 
 st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
 # Hàng 2: Phân bổ công suất + Log
 col_chart, col_log = st.columns([3, 2])
-
 with col_chart:
     st.markdown("#### ⚡ Phân bổ công suất theo thời gian")
     ph_chart = st.empty()
-
 with col_log:
     st.markdown("#### 📋 Nhật ký sự kiện")
     ph_log = st.empty()
@@ -662,7 +457,7 @@ ph_stat4 = col_s4.empty()
 
 
 # ══════════════════════════════════════════════════════════
-# KHỞI TẠO STATE
+# KHỞI TẠO STATE & CONSTANTS
 # ══════════════════════════════════════════════════════════
 if "frame_idx"     not in st.session_state: st.session_state.frame_idx     = 0
 if "power_history" not in st.session_state: st.session_state.power_history = []
@@ -671,36 +466,30 @@ if "outage_count"  not in st.session_state: st.session_state.outage_count  = 0
 if "bl_only_count" not in st.session_state: st.session_state.bl_only_count = 0
 if "total_frames"  not in st.session_state: st.session_state.total_frames  = 0
 
-# Khởi tạo VideoSource cho 2 UE — lưu trong session_state để tồn tại qua rerun
 if "vsrc" not in st.session_state:
     st.session_state.vsrc = [VideoSource(0), VideoSource(1)]
-vsrc = st.session_state.vsrc  # shorthand
+vsrc = st.session_state.vsrc
 
-# Nếu user vừa upload file mới → load vào VideoSource tương ứng
 for _k, _uploaded in enumerate([ue1_file, ue2_file]):
     if _uploaded is not None:
-        _ok = vsrc[_k].load_from_upload(_uploaded)
-        if not _ok:
-            st.warning(f"⚠️ Không đọc được file video UE{_k+1}. Hãy dùng MP4/AVI/MOV hợp lệ.")
+        if not vsrc[_k].load_from_upload(_uploaded):
+            st.warning(f"⚠️ Không đọc được file video UE{_k+1}.")
 
-codec = CustomSVCCodec(scale=0.5)
+codec = AdvancedFGS_Codec(base_qp=28, n_bitplanes=8)
 FRAME_SIZE = (320, 240)
-MAX_HISTORY = 30   # Giữ 30 điểm lịch sử trên biểu đồ
-MAX_LOG     = 8    # Số dòng log tối đa hiển thị
+MAX_HISTORY = 30
+MAX_LOG = 8
 
+# GIẢ ĐỊNH TỐC ĐỘ FRAME CHUẨN ĐỂ TÍNH BĂNG THÔNG (Dù mô phỏng chạy chậm đến đâu)
+VIDEO_FPS_ASSUMPTION = 30.0
 
-# ══════════════════════════════════════════════════════════
-# VÒNG LẶP MÔ PHỎNG THỜI GIAN THỰC
-# ══════════════════════════════════════════════════════════
 def add_log(msg: str):
     ts = time.strftime("%H:%M:%S")
     st.session_state.log_events.insert(0, f"[{ts}] {msg}")
     if len(st.session_state.log_events) > MAX_LOG:
         st.session_state.log_events.pop()
 
-
-def render_status_html(label: str, css_class: str, psnr: float,
-                        cap_mbps: float, p_w: float) -> str:
+def render_status_html(label: str, css_class: str, psnr: float, cap_mbps: float, p_w: float) -> str:
     return f"""
     <div class="user-card">
         <span class="status-badge {css_class}">{label}</span>
@@ -710,11 +499,11 @@ def render_status_html(label: str, css_class: str, psnr: float,
                 <div class="metric-value">{psnr:.1f} dB</div>
             </div>
             <div class="metric-box">
-                <div class="metric-label">Capacity</div>
-                <div class="metric-value">{cap_mbps:.1f} Mbps</div>
+                <div class="metric-label">Capacity (Riêng)</div>
+                <div class="metric-value">{cap_mbps:.2f} Mbps</div>
             </div>
             <div class="metric-box">
-                <div class="metric-label">Công suất</div>
+                <div class="metric-label">P.Phát</div>
                 <div class="metric-value">{p_w*1000:.1f} mW</div>
             </div>
         </div>
@@ -722,148 +511,128 @@ def render_status_html(label: str, css_class: str, psnr: float,
     """
 
 
-def render_power_bar(pc1, pc2, pp1, pp2, total) -> str:
-    """Tạo thanh công suất HTML trực quan."""
-    def pct(v): return max(0, min(100, v / total * 100)) if total > 0 else 0
-    return f"""
-    <div style="font-size:0.75rem; color:#5588aa; margin-bottom:4px;">Common U1</div>
-    <div class="power-bar-bg"><div class="power-bar-fill bar-common"
-        style="width:{pct(pc1):.1f}%">{pct(pc1):.0f}%</div></div>
-    <div style="font-size:0.75rem; color:#5588aa; margin-bottom:4px;">Common U2</div>
-    <div class="power-bar-bg"><div class="power-bar-fill bar-common"
-        style="width:{pct(pc2):.1f}%">{pct(pc2):.0f}%</div></div>
-    <div style="font-size:0.75rem; color:#5588aa; margin-bottom:4px;">Private U1</div>
-    <div class="power-bar-bg"><div class="power-bar-fill bar-private"
-        style="width:{pct(pp1):.1f}%">{pct(pp1):.0f}%</div></div>
-    <div style="font-size:0.75rem; color:#5588aa; margin-bottom:4px;">Private U2</div>
-    <div class="power-bar-bg"><div class="power-bar-fill bar-private"
-        style="width:{pct(pp2):.1f}%">{pct(pp2):.0f}%</div></div>
-    """
-
-
+# ══════════════════════════════════════════════════════════
+# VÒNG LẶP MÔ PHỎNG (SẼ CHẠY NHANH HẾT MỨC CPU CHO PHÉP)
+# ══════════════════════════════════════════════════════════
 if not run_sim:
-    st.info("▶ Bật công tắc **'Chạy mô phỏng'** ở thanh bên để bắt đầu.")
+    st.info("▶ Bật công tắc **'Chạy mô phỏng (Frame-by-Frame)'** để bắt đầu.")
     st.stop()
 
-# ── Vòng lặp vô hạn (dừng khi tắt toggle) ──────────────
 for _ in range(10000):
-
-    if not run_sim:
-        break
+    if not run_sim: break
 
     idx = st.session_state.frame_idx
     st.session_state.total_frames += 1
 
-    # ── 1. Lấy frame riêng của từng UE ──────────────────
-    # Mỗi UE có nguồn video độc lập (upload hoặc giả lập)
-    # → BL và EL của 2 UE sẽ khác nhau, phản ánh đúng thực tế
+    # ── 1. Lấy frame gốc của từng UE
     orig_frames = [vsrc[k].next_frame(idx, FRAME_SIZE) for k in range(2)]
 
-    # ── 2. Mã hóa SVC độc lập cho từng UE ───────────────
-    # bl_data[k], el_data[k]: dữ liệu lớp BL/EL của UE k
-    # bl_mbps[k], el_mbps[k]: bitrate yêu cầu của UE k (Mbps)
+    # ── 2. Mã hóa FGS độc lập (Nặng nhất, quyết định tốc độ vòng lặp)
     svc_results = [codec.encode(orig_frames[k]) for k in range(2)]
-    bl_data  = [svc_results[k][0] for k in range(2)]   # BL thumbnail
-    el_data  = [svc_results[k][1] for k in range(2)]   # EL residual
-    bl_bytes = [svc_results[k][2] for k in range(2)]   # bytes BL
-    el_bytes = [svc_results[k][3] for k in range(2)]   # bytes EL
-    # Chuyển sang Mbps (mỗi frame gửi trong 1/fps giây)
-    bl_mbps  = [(bl_bytes[k] * 8) / 1e6 * target_fps for k in range(2)]
-    el_mbps  = [(el_bytes[k] * 8) / 1e6 * target_fps for k in range(2)]
+    bl_data  = [svc_results[k][0] for k in range(2)]
+    el_data  = [svc_results[k][1] for k in range(2)]
+    bl_bytes = [svc_results[k][2] for k in range(2)]
+    el_bytes = [svc_results[k][3] for k in range(2)]
 
-    # ── 3. Tính kênh truyền ─────────────────────────────
-    h1 = path_loss(d1)
-    h2 = path_loss(d2)
+    # TÍNH TOÁN BĂNG THÔNG DỰA TRÊN TỐC ĐỘ FRAME CỐ ĐỊNH CHUẨN
+    bl_mbps  = [(bl_bytes[k] * 8 * VIDEO_FPS_ASSUMPTION) / 1e6 for k in range(2)]
+    el_mbps  = [
+        [(layer_b * 8 * VIDEO_FPS_ASSUMPTION) / 1e6 for layer_b in el_bytes[k]]
+        for k in range(2)
+    ]
+
+    # ── 3. Tính kênh truyền
+    h1 = path_loss(d1); h2 = path_loss(d2)
     H  = np.array([h1, h2])
 
-    # ── 4. Tối ưu RSMA Min-Max ──────────────────────────
-    # R_req_common: Common stream phải đủ để mang BL của cả 2 UE
-    # Vì mỗi UE có video riêng → BL bitrate khác nhau
-    # Dùng max(bl_mbps[0], bl_mbps[1]): đảm bảo UE nào nặng hơn cũng qua được
-    R_req = max(bl_mbps[0], bl_mbps[1])
-    result = optimize_rsma_minmax(H, P_max_watt, R_req, noise_power)
+    # ── 4. Tối ưu RSMA & Điều khiển thu nhận
+    R_req_both = bl_mbps[0] + bl_mbps[1]
+    result = optimize_rsma_minmax(H, P_max_watt, R_req_both * 1.01, noise_power)
 
-    c_common   = result["C_common"]       # Mbps
-    c_priv     = result["C_private"]      # [C_priv_1, C_priv_2]
-    pc_vals    = result["P_common"]       # [pc1, pc2]
-    pp_vals    = result["P_private"]      # [pp1, pp2]
+    ue2_dropped_by_bs = False
+    if result["C_common"] < R_req_both:
+        add_log("⚠️ Kênh quá tải! BS ngắt UE2 để cứu UE1.")
+        R_req_ue1_only = bl_mbps[0] * 1.01
+        result = optimize_rsma_minmax(H, P_max_watt, R_req_ue1_only, noise_power)
+        ue2_dropped_by_bs = True
+
+    c_common   = result["C_common"]
+    c_priv     = result["C_private"]
+    pc_vals    = result["P_common"]
+    pp_vals    = result["P_private"]
     opt_status = result["status"]
 
-    # ── 5. Quyết định chất lượng video mỗi User ─────────
-    # Logic đúng cho RSMA:
-    # - Common stream mang BL → cả 2 user nhận được nếu c_common ≥ bl_mbps
-    # - Private stream mang EL riêng từng user → kiểm tra c_priv[k] ≥ el_mbps
-    # - Outage chỉ xảy ra khi c_common < bl_mbps (BL không qua được)
-    # - BL-Only khi c_common đủ nhưng c_priv[k] không đủ cho EL của user k
+    # ── 5. Decode và Tính số lớp EL nhận được
     user_frames  = []
     user_labels  = []
     user_classes = []
     user_psnrs   = []
 
-    # Kiểm tra từng UE độc lập:
-    # - Common stream phải ≥ bl_mbps[k] (BL của UE k) → UE k mới nhận được BL
-    # - Private stream phải ≥ el_mbps[k] (EL của UE k) → UE k mới nhận được EL
-    # Vì mỗi UE upload video riêng, bl_mbps[0] ≠ bl_mbps[1]
-
-    for k in range(2):
-        # Outage UE k: Common không đủ mang BL của UE k
-        if c_common < bl_mbps[k]:
-            black = np.zeros((FRAME_SIZE[1], FRAME_SIZE[0], 3), dtype=np.uint8)
+    if c_common < bl_mbps[0]:
+        st.session_state.outage_count += 1
+        add_log(f"⛔ TOTAL OUTAGE: Sức chứa {c_common:.3f} < Yêu cầu {bl_mbps[0]:.3f} Mbps")
+        for k in range(2):
+            black = np.zeros((128, 128, 3), dtype=np.uint8)
             noisy = add_noise_overlay(black, 60)
-            noisy = overlay_status(noisy, "DISCONNECTED", (0, 0, 255))
-            user_frames.append(noisy)
-            user_labels.append("DISCONNECTED ⛔")
-            user_classes.append("status-out")
-            user_psnrs.append(0.0)
-            st.session_state.outage_count += 1
-            add_log(f"⛔ UE{k+1} OUTAGE: C_com={c_common:.2f} < BL={bl_mbps[k]:.2f} Mbps")
+            user_frames.append(overlay_status(noisy, "TOTAL OUTAGE", (0, 0, 255)))
+            user_labels.append("TOTAL OUTAGE ⛔"); user_classes.append("status-out"); user_psnrs.append(0.0)
+    else:
+        for k in range(2):
+            if k == 1 and ue2_dropped_by_bs:
+                black = np.zeros((128, 128, 3), dtype=np.uint8)
+                noisy = add_noise_overlay(black, 60)
+                user_frames.append(overlay_status(noisy, "DROPPED BY BS", (0, 0, 255)))
+                user_labels.append("DROPPED BY BS ⛔"); user_classes.append("status-out"); user_psnrs.append(0.0)
+                st.session_state.outage_count += 1
+                continue
 
-        elif c_priv[k] < el_mbps[k]:
-            # BL qua được nhưng EL riêng không đủ — chỉ xem BL
-            dec, _ = codec.decode(bl_data[k], None, FRAME_SIZE)
-            dec = overlay_status(dec, "BL ONLY", (0, 200, 255))
-            psnr = codec.compute_psnr(orig_frames[k], dec)
+            # Đếm số lớp EL (FGS Layer) trạm gốc gánh được
+            private_cap = c_priv[k]
+            layers_to_decode = 0
+            cap_accumulated = 0.0
+
+            for i, el_req in enumerate(el_mbps[k]):
+                if private_cap >= (cap_accumulated + el_req):
+                    cap_accumulated += el_req
+                    layers_to_decode += 1
+                else:
+                    break
+
+            if layers_to_decode == 0:
+                st.session_state.bl_only_count += 1
+
+            dec, status_text = codec.decode(bl_data[k], el_data[k], layers_received=layers_to_decode, orig_shape=(128,128))
+
+            green_val = int((layers_to_decode / 8) * 255)
+            dec = overlay_status(dec, status_text, (0, 255, green_val))
+
             user_frames.append(dec)
-            user_labels.append(f"BL ONLY 📺  (U{k+1})")
-            user_classes.append("status-sd")
-            user_psnrs.append(psnr)
-            st.session_state.bl_only_count += 1
-            add_log(f"⚠️ UE{k+1} BL-Only: C_priv={c_priv[k]:.2f} < EL={el_mbps[k]:.2f} Mbps")
-        else:
-            # Full HD — BL + EL riêng của UE k
-            dec, _ = codec.decode(bl_data[k], el_data[k], FRAME_SIZE)
-            dec = overlay_status(dec, "FULL HD ", (0, 255, 128))
-            psnr = codec.compute_psnr(orig_frames[k], dec)
-            user_frames.append(dec)
-            user_labels.append(f"FULL HD   (U{k+1})")
-            user_classes.append("status-hd")
-            user_psnrs.append(psnr)
+            user_labels.append(status_text)
+            user_classes.append("status-hd" if layers_to_decode >= 6 else "status-sd")
+            user_psnrs.append(codec.compute_psnr(orig_frames[k], dec))
 
-    # ── 6. Cập nhật giao diện ───────────────────────────
+    # ── 6. Hiển thị Giao diện Song song (Original vs Received)
+    # User 1
+    # Ghi chú: orig_frames là 320x240, nhưng FGS encode là 128x128.
+    # Ta hiển thị cả 2, Streamlit sẽ tự scale cho vừa cột.
+    ph_img1_orig.image(frame_to_rgb(orig_frames[0]), use_container_width=True)
+    ph_img1_recv.image(frame_to_rgb(user_frames[0]), use_container_width=True)
 
-    # Video User 1
-    ph_img1.image(frame_to_rgb(user_frames[0]),
-                  caption=f"UE1 | {vsrc[0].source_label} | d={d1}m | h={h1:.2e}",
-                  use_container_width=True)
     ph_status1.markdown(
-        render_status_html(user_labels[0], user_classes[0],
-                           user_psnrs[0], c_priv[0],
-                           float(pc_vals[0]) + float(pp_vals[0])),
+        render_status_html(user_labels[0], user_classes[0], user_psnrs[0], c_priv[0], float(pc_vals[0]) + float(pp_vals[0])),
         unsafe_allow_html=True
     )
 
-    # Video User 2
-    ph_img2.image(frame_to_rgb(user_frames[1]),
-                  caption=f"UE2 | {vsrc[1].source_label} | d={d2}m | h={h2:.2e}",
-                  use_container_width=True)
+    # User 2
+    ph_img2_orig.image(frame_to_rgb(orig_frames[1]), use_container_width=True)
+    ph_img2_recv.image(frame_to_rgb(user_frames[1]), use_container_width=True)
+
     ph_status2.markdown(
-        render_status_html(user_labels[1], user_classes[1],
-                           user_psnrs[1], c_priv[1],
-                           float(pc_vals[1]) + float(pp_vals[1])),
+        render_status_html(user_labels[1], user_classes[1], user_psnrs[1], c_priv[1], float(pc_vals[1]) + float(pp_vals[1])),
         unsafe_allow_html=True
     )
 
-    # Lịch sử công suất
+    # Biểu đồ và Log
     st.session_state.power_history.append({
         "Frame":      idx,
         "P_common_U1 (mW)":  float(pc_vals[0]) * 1000,
@@ -871,33 +640,20 @@ for _ in range(10000):
         "P_private_U1 (mW)": float(pp_vals[0]) * 1000,
         "P_private_U2 (mW)": float(pp_vals[1]) * 1000,
     })
-    if len(st.session_state.power_history) > MAX_HISTORY:
-        st.session_state.power_history.pop(0)
+    if len(st.session_state.power_history) > MAX_HISTORY: st.session_state.power_history.pop(0)
 
-    # Biểu đồ Bar Chart công suất
-    df_hist = pd.DataFrame(st.session_state.power_history).set_index("Frame")
-    ph_chart.bar_chart(df_hist, height=220)
+    ph_chart.bar_chart(pd.DataFrame(st.session_state.power_history).set_index("Frame"), height=220)
 
-    # Log sự kiện
     log_html = '<div class="log-box">' + "<br>".join(
-        st.session_state.log_events
-        if st.session_state.log_events
-        else ["Hệ thống đang chạy bình thường..."]
+        st.session_state.log_events if st.session_state.log_events else ["Hệ thống đang chạy bình thường..."]
     ) + "</div>"
     ph_log.markdown(log_html, unsafe_allow_html=True)
 
-    # Thống kê tổng quan
+    # Thống kê
     total = st.session_state.total_frames
-    outage_pct = st.session_state.outage_count / max(total, 1) * 100
-    blonly_pct = st.session_state.bl_only_count / max(total, 1) * 100
-
     ph_stat1.metric("📦 Frames xử lý", f"{total}")
-    ph_stat2.metric("⛔ Tỷ lệ mất kết nối", f"{outage_pct:.1f}%")
-    ph_stat3.metric("📺 Tỷ lệ BL-Only (U2)", f"{blonly_pct:.1f}%")
+    ph_stat2.metric("⛔ Tỷ lệ mất kết nối", f"{st.session_state.outage_count / max(total, 1) * 100:.1f}%")
+    ph_stat3.metric("📺 Tỷ lệ BL-Only", f"{st.session_state.bl_only_count / max(total, 1) * 100:.1f}%")
     ph_stat4.metric("⚡ Solver", opt_status[:12])
 
-    # Tăng frame index
     st.session_state.frame_idx += 1
-
-    # Delay để điều chỉnh fps mô phỏng
-    time.sleep(1.0 / target_fps)
