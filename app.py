@@ -206,69 +206,127 @@ class AdvancedFGS_Codec:
 # ══════════════════════════════════════════════════════════
 # THÀNH PHẦN 2 — TỐI ƯU RSMA MIN-MAX FAIRNESS (CVXPY)
 # ══════════════════════════════════════════════════════════
-def optimize_rsma_minmax(H: np.ndarray, P_max: float,
-                          R_req_common: float, noise_power: float = 1e-9):
+def _capacity(h: float, p: float, noise_power: float, bw: float = 1.0) -> float:
+    """Shannon capacity [Mbps] cho 1 user."""
+    return bw * np.log2(1.0 + float(h) ** 2 * max(float(p), 0.0) / noise_power)
+
+
+def _min_power_for_rate(h: float, R: float, noise_power: float, bw: float = 1.0) -> float:
+    """Công suất tối thiểu (W) để đạt tốc độ R Mbps."""
+    if R <= 0:
+        return 0.0
+    return noise_power * (2 ** (R / bw) - 1.0) / max(float(h) ** 2, 1e-30)
+
+
+def optimize_rsma_minmax(
+    H: np.ndarray,
+    P_max: float,
+    R_req_common: float,          # = BL_UE1 + BL_UE2 (tổng yêu cầu BL)
+    noise_power: float = 1e-9,
+    bl_mbps_per_user: list = None # [BL_UE1, BL_UE2] — ưu tiên cứng BL
+):
+    """
+    Tối ưu RSMA Min-Max Fairness với ưu tiên cứng Base Layer (BL-first).
+
+    Chiến lược BL-first:
+      1. Dành trước công suất p_c_min để đảm bảo BL chắc chắn được phục vụ
+         (hard constraint: C_common >= R_req_common).
+      2. Phần công suất còn lại mới phân bổ cho EL theo min-max fairness.
+      3. EL không bao giờ cạnh tranh tài nguyên với BL.
+    """
+    BW   = 1.0
+    K    = len(H)
+    nz   = max(noise_power, 1e-15)
+
+    # ── BƯỚC 0: Kiểm tra khả thi vật lý ngay từ đầu ──────────────────────
+    # Tính công suất tối thiểu lý thuyết cho BL (dùng user tốt nhất mỗi kênh,
+    # vì đây là uplink từ BS → UE nhưng capacity tính theo SNR từng kênh)
+    p_bl_min_per_user = [_min_power_for_rate(H[k], R_req_common / K, nz, BW) for k in range(K)]
+    p_bl_min_total    = sum(p_bl_min_per_user)
+
     try:
         import cvxpy as cp
-        K = len(H)
-        p_c = cp.Variable(K, nonneg=True)
-        p_p = cp.Variable(K, nonneg=True)
 
-        constraints = [cp.sum(p_c) + cp.sum(p_p) <= P_max]
-        for k in range(K):
-            constraints.extend([p_c[k] >= 0, p_p[k] >= 0])
+        p_c = cp.Variable(K, nonneg=True)   # công suất common (BL)
+        p_p = cp.Variable(K, nonneg=True)   # công suất private (EL)
 
-        BW = 1.0 # Băng thông 1MHz
+        constraints = [
+            cp.sum(p_c) + cp.sum(p_p) <= P_max,
+        ]
 
-        cap_common_terms = []
+        cap_common_terms  = []
         cap_private_terms = []
         for k in range(K):
-            h2 = float(H[k] ** 2)
-            sinr_c = h2 * p_c[k] / noise_power
+            h2     = float(H[k] ** 2)
+            # Common stream (BL)
+            sinr_c = h2 * p_c[k] / nz
             cap_c  = BW * cp.log(1 + sinr_c) / np.log(2)
             cap_common_terms.append(cap_c)
-
-            sinr_p = h2 * p_p[k] / noise_power
+            # Private stream (EL)
+            sinr_p = h2 * p_p[k] / nz
             cap_p  = BW * cp.log(1 + sinr_p) / np.log(2)
             cap_private_terms.append(cap_p)
 
+        # ── RÀNG BUỘC CỨNG BL (BL-first): common capacity PHẢI >= tổng BL ──
         constraints.append(sum(cap_common_terms) >= R_req_common)
 
+        # Ràng buộc mềm BL per-user (nếu được cung cấp): mỗi user ít nhất
+        # nhận đủ BL từ common stream phần của họ
+        if bl_mbps_per_user is not None:
+            for k in range(K):
+                h2     = float(H[k] ** 2)
+                sinr_c = h2 * p_c[k] / nz
+                cap_ck = BW * cp.log(1 + sinr_c) / np.log(2)
+                constraints.append(cap_ck >= bl_mbps_per_user[k])
+
+        # Mục tiêu: tối đa hoá min private capacity (EL fairness)
         t = cp.Variable()
         for k in range(K):
             constraints.append(cap_private_terms[k] >= t)
 
         prob = cp.Problem(cp.Maximize(t), constraints)
-        prob.solve(solver=cp.SCS, verbose=False, eps=1e-4)
+        prob.solve(solver=cp.SCS, verbose=False, eps=1e-4, max_iters=5000)
 
         if prob.status not in ["optimal", "optimal_inaccurate"]:
-            raise ValueError(f"CVXPY: {prob.status}")
+            raise ValueError(f"CVXPY solver: {prob.status}")
 
-        pc_val = np.maximum(p_c.value, 0)
-        pp_val = np.maximum(p_p.value, 0)
+        pc_val = np.maximum(p_c.value, 0.0)
+        pp_val = np.maximum(p_p.value, 0.0)
 
-        def cap(h, p): return BW * np.log2(1 + h**2 * p / noise_power)
+        c_common  = float(sum(_capacity(H[k], pc_val[k], nz, BW) for k in range(K)))
+        c_private = [float(_capacity(H[k], pp_val[k], nz, BW)) for k in range(K)]
 
         return {
-            "P_common":    pc_val,
-            "P_private":   pp_val,
-            "C_common":    float(sum(cap(H[k], pc_val[k]) for k in range(K))),
-            "C_private":   [float(cap(H[k], pp_val[k])) for k in range(K)],
-            "status":      "optimal",
+            "P_common":   pc_val,
+            "P_private":  pp_val,
+            "C_common":   c_common,
+            "C_private":  c_private,
+            "status":     "optimal",
+            "bl_feasible": c_common >= R_req_common * 0.999,
         }
 
     except Exception as e:
-        pc_fallback = np.array([P_max * 0.4, P_max * 0.4])
-        pp_fallback = np.array([P_max * 0.1, P_max * 0.1])
-        noise_power_fb = noise_power if noise_power else 1e-9
-        def cap_fb(h, p): return 1.0 * np.log2(1 + float(h)**2 * p / noise_power_fb)
+        # ── FALLBACK: BL-first phân bổ tay ──────────────────────────────────
+        # Dành P_BL trước cho BL, phần còn lại chia đều cho EL
+        nz_fb = max(noise_power, 1e-15)
+
+        # Tính p_c tối thiểu để đảm bảo BL
+        p_bl_reserved = min(p_bl_min_total * 1.2, P_max * 0.70)  # tối đa 70% cho BL
+        p_el_budget   = max(P_max - p_bl_reserved, 0.0)
+
+        pc_fallback = np.array([p_bl_reserved / K] * K)
+        pp_fallback = np.array([p_el_budget   / K] * K)
+
+        c_common  = sum(_capacity(H[k], pc_fallback[k], nz_fb, BW) for k in range(K))
+        c_private = [_capacity(H[k], pp_fallback[k], nz_fb, BW) for k in range(K)]
 
         return {
-            "P_common":    pc_fallback,
-            "P_private":   pp_fallback,
-            "C_common":    sum(cap_fb(H[k], pc_fallback[k]) for k in range(len(H))),
-            "C_private":   [cap_fb(H[k], pp_fallback[k]) for k in range(len(H))],
-            "status":      f"fallback ({str(e)[:40]})",
+            "P_common":   pc_fallback,
+            "P_private":  pp_fallback,
+            "C_common":   float(c_common),
+            "C_private":  [float(c) for c in c_private],
+            "status":     f"fallback ({str(e)[:40]})",
+            "bl_feasible": float(c_common) >= R_req_common * 0.999,
         }
 
 
@@ -376,7 +434,7 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("### 🔋 Công suất phát")
-    P_max_dbm = st.slider("P_max (dBm)", min_value=10, max_value=40, value=23, step=1)
+    P_max_dbm = st.slider("P_max (dBm)", min_value=10, max_value=100, value=23, step=1)
     P_max_watt = 10 ** ((P_max_dbm - 30) / 10)
 
     st.markdown("### 📍 Khoảng cách người dùng")
@@ -414,7 +472,7 @@ st.markdown('<div class="main-title">📡 MÔ PHỎNG RSMA FGS — FRAME-BY-FRAM
 col_v1, col_v2 = st.columns(2)
 
 with col_v1:
-    st.markdown("#### 👤 User 1 (Gần trạm)")
+    st.markdown("#### 👤 User 1    (Gần trạm)")
     c1_orig, c1_recv = st.columns(2)
     with c1_orig:
         st.markdown("<div style='text-align:center; color:#88aaff; font-size:0.85rem;'>UE gửi (Original)</div>", unsafe_allow_html=True)
@@ -425,7 +483,7 @@ with col_v1:
     ph_status1 = st.empty()
 
 with col_v2:
-    st.markdown("#### 👥 User 2 (Xa trạm)")
+    st.markdown("#### 👥 User 2   (Xa trạm)")
     c2_orig, c2_recv = st.columns(2)
     with c2_orig:
         st.markdown("<div style='text-align:center; color:#88aaff; font-size:0.85rem;'>UE gửi (Original)</div>", unsafe_allow_html=True)
@@ -545,22 +603,39 @@ for _ in range(10000):
     h1 = path_loss(d1); h2 = path_loss(d2)
     H  = np.array([h1, h2])
 
-    # ── 4. Tối ưu RSMA & Điều khiển thu nhận
+    # ── 4. Tối ưu RSMA & Điều khiển thu nhận (BL-First Priority)
     R_req_both = bl_mbps[0] + bl_mbps[1]
-    result = optimize_rsma_minmax(H, P_max_watt, R_req_both * 1.01, noise_power)
+
+    # Truyền yêu cầu BL per-user để optimizer đảm bảo cứng từng user
+    result = optimize_rsma_minmax(
+        H, P_max_watt,
+        R_req_both * 1.01,
+        noise_power,
+        bl_mbps_per_user=[bl_mbps[0] * 1.01, bl_mbps[1] * 1.01],
+    )
 
     ue2_dropped_by_bs = False
-    if result["C_common"] < R_req_both:
-        add_log("⚠️ Kênh quá tải! BS ngắt UE2 để cứu UE1.")
+
+    # Kiểm tra: nếu capacity common KHÔNG đủ cho cả 2 BL
+    # → ưu tiên UE1 (BL-first): tái tối ưu chỉ phục vụ UE1
+    if not result.get("bl_feasible", True) or result["C_common"] < R_req_both * 0.99:
+        add_log(f"⚠️ Kênh không đủ cho cả 2 BL ({result['C_common']:.3f} < {R_req_both:.3f} Mbps). "
+                f"BS ưu tiên BL UE1, ngắt UE2.")
         R_req_ue1_only = bl_mbps[0] * 1.01
-        result = optimize_rsma_minmax(H, P_max_watt, R_req_ue1_only, noise_power)
+        result = optimize_rsma_minmax(
+            H, P_max_watt,
+            R_req_ue1_only,
+            noise_power,
+            bl_mbps_per_user=[bl_mbps[0] * 1.01, 0.0],
+        )
         ue2_dropped_by_bs = True
 
-    c_common   = result["C_common"]
-    c_priv     = result["C_private"]
-    pc_vals    = result["P_common"]
-    pp_vals    = result["P_private"]
-    opt_status = result["status"]
+    c_common    = result["C_common"]
+    c_priv      = result["C_private"]
+    pc_vals     = result["P_common"]
+    pp_vals     = result["P_private"]
+    opt_status  = result["status"]
+    bl_feasible = result.get("bl_feasible", c_common >= bl_mbps[0] * 0.99)
 
     # ── 5. Decode và Tính số lớp EL nhận được
     user_frames  = []
@@ -568,43 +643,64 @@ for _ in range(10000):
     user_classes = []
     user_psnrs   = []
 
-    if c_common < bl_mbps[0]:
+    # ── BL-first decode logic ────────────────────────────────────────────────
+    # Sau khi optimizer đã đảm bảo BL, chỉ còn 2 trường hợp thực:
+    #   (a) UE2 bị ngắt vì kênh không đủ cho cả 2 BL → ue2_dropped_by_bs
+    #   (b) Cả 2 đều được phục vụ BL, EL dùng phần dư sau BL
+    #
+    # "TOTAL OUTAGE" chỉ xảy ra khi kênh không đủ ngay cả cho UE1 BL một mình.
+    # Trường hợp này rất hiếm vì optimizer đã được ràng buộc cứng BL.
+
+    bl1_feasible = bl_feasible   # Đã được kiểm tra trong optimizer (ràng buộc cứng BL)
+
+    if not bl1_feasible:
+        # Trường hợp ngoại lệ thực sự: kênh quá tệ, không cứu được
         st.session_state.outage_count += 1
-        add_log(f"⛔ TOTAL OUTAGE: Sức chứa {c_common:.3f} < Yêu cầu {bl_mbps[0]:.3f} Mbps")
+        add_log(f"⛔ OUTAGE THỰC SỰ: C_common={c_common:.3f} < BL_UE1={bl_mbps[0]:.3f} Mbps "
+                f"(kênh quá tệ, P_max có thể quá thấp)")
         for k in range(2):
             black = np.zeros((128, 128, 3), dtype=np.uint8)
             noisy = add_noise_overlay(black, 60)
-            user_frames.append(overlay_status(noisy, "TOTAL OUTAGE", (0, 0, 255)))
-            user_labels.append("TOTAL OUTAGE ⛔"); user_classes.append("status-out"); user_psnrs.append(0.0)
+            user_frames.append(overlay_status(noisy, "NO SIGNAL", (0, 0, 255)))
+            user_labels.append("NO SIGNAL ⛔"); user_classes.append("status-out"); user_psnrs.append(0.0)
     else:
         for k in range(2):
             if k == 1 and ue2_dropped_by_bs:
+                # UE2 bị ngắt có chủ đích để ưu tiên BL UE1 — hiển thị rõ lý do
                 black = np.zeros((128, 128, 3), dtype=np.uint8)
-                noisy = add_noise_overlay(black, 60)
-                user_frames.append(overlay_status(noisy, "DROPPED BY BS", (0, 0, 255)))
-                user_labels.append("DROPPED BY BS ⛔"); user_classes.append("status-out"); user_psnrs.append(0.0)
+                noisy = add_noise_overlay(black, 40)
+                user_frames.append(overlay_status(noisy, "UE2: BL DEFERRED", (0, 100, 255)))
+                user_labels.append("UE2 BL DEFERRED ⚠️"); user_classes.append("status-out"); user_psnrs.append(0.0)
                 st.session_state.outage_count += 1
                 continue
 
-            # Đếm số lớp EL (FGS Layer) trạm gốc gánh được
-            private_cap = c_priv[k]
+            # BL luôn được đảm bảo (do optimizer ràng buộc cứng)
+            # → EL sử dụng phần dư: private_cap - 0 (BL đã nằm trong common stream)
+            # private_cap hoàn toàn dành cho EL refinement
+            private_cap      = c_priv[k]
             layers_to_decode = 0
-            cap_accumulated = 0.0
+            cap_accumulated  = 0.0
 
             for i, el_req in enumerate(el_mbps[k]):
-                if private_cap >= (cap_accumulated + el_req):
-                    cap_accumulated += el_req
+                if private_cap >= cap_accumulated + el_req:
+                    cap_accumulated  += el_req
                     layers_to_decode += 1
                 else:
-                    break
+                    break   # FGS truncation — BL vẫn được giữ nguyên
 
             if layers_to_decode == 0:
                 st.session_state.bl_only_count += 1
+                add_log(f"📺 UE{k+1}: BL-Only (private_cap={private_cap:.3f} Mbps, "
+                        f"EL[0]={el_mbps[k][0]:.3f} Mbps)")
 
-            dec, status_text = codec.decode(bl_data[k], el_data[k], layers_received=layers_to_decode, orig_shape=(128,128))
+            dec, status_text = codec.decode(
+                bl_data[k], el_data[k],
+                layers_received=layers_to_decode,
+                orig_shape=(128, 128)
+            )
 
-            green_val = int((layers_to_decode / 8) * 255)
-            dec = overlay_status(dec, status_text, (0, 255, green_val))
+            green_val = int((layers_to_decode / codec.n_planes) * 255)
+            dec = overlay_status(dec, status_text, (0, green_val, 255 - green_val))
 
             user_frames.append(dec)
             user_labels.append(status_text)
