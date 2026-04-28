@@ -1,21 +1,3 @@
-"""
-SVC Fine Granular Scalability (FGS) - Python Implementation
-============================================================
-Fine Granular Scalability (FGS) is a video coding technique within
-Scalable Video Coding (SVC) that allows the enhancement layer bitrate
-to be truncated at any bit position, enabling smooth, continuous
-quality adaptation without re-encoding.
-
-Architecture:
-  - Base Layer (BL): Coarse quality, independently decodable
-  - FGS Enhancement Layer (EL): Progressive refinement bitstream
-    that can be cut at any point for partial quality improvement
-
-References:
-  - W. Li, "Fine granularity scalability in MPEG-4 video," IEEE TCSV 2001
-  - MPEG-4 Part 2 FGS / H.264 SVC standards
-"""
-
 import numpy as np
 from typing import Tuple, List, Optional
 
@@ -56,29 +38,14 @@ def dequantize(qcoeffs: np.ndarray, qp: int) -> np.ndarray:
 # Bit-plane decomposition (core of FGS)
 # ---------------------------------------------------------------------------
 
-def residual_to_bitplanes(residual: np.ndarray, n_planes: int = 8) -> List[np.ndarray]:
-    """
-    Decompose a 2-D integer residual array into bit-planes.
-
-    Bit-plane 0 (MSB) carries the most energy; plane (n_planes-1) is LSB.
-    Signs are stored separately in plane 0.
-
-    Returns
-    -------
-    planes : list of n_planes arrays, dtype int8
-        planes[0] contains MSB and sign information (2-complement style).
-    """
-    # Work with absolute values; store sign in a separate mask packed into plane 0
+def residual_to_bitplanes(residual: np.ndarray,
+                          n_planes: int = 8)-> List[np.ndarray]:
     abs_r = np.abs(residual).astype(np.int32)
     sign  = np.sign(residual).astype(np.int8)   # -1, 0, +1
-
     planes = []
     for p in range(n_planes - 1, -1, -1):        # MSB first
         plane = ((abs_r >> p) & 1).astype(np.int8)
         planes.append(plane)
-
-    # Embed sign into the MSB plane: multiply each bit by its sign
-    # (convention: sign stored alongside first significant bit)
     planes[0] = planes[0] * sign                 # values in {-1, 0, +1}
     return planes
 
@@ -304,10 +271,6 @@ def estimate_bitrate(
     enh_layer:   List[List[List[np.ndarray]]],
     n_refine:    Optional[int] = None
 ) -> int:
-    """
-    Rough bit count for base layer + (truncated) enhancement layer.
-    Uses naive bit-counting (entropy coding not modelled here).
-    """
     # Base layer: count non-zero coefficients × 8 bits each
     base_bits = int(np.count_nonzero(base_layer)) * 8
 
